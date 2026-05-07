@@ -1,0 +1,1124 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SINAG | Laguna Solar Intelligence</title>
+
+    <!-- Core UI -->
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+
+    <!-- Mapbox GL JS -->
+    <script src="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.js"></script>
+    <link href="https://api.mapbox.com/mapbox-gl-js/v3.3.0/mapbox-gl.css" rel="stylesheet" />
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;600;800&display=swap');
+
+        * { box-sizing: border-box; }
+        body { font-family: 'Plus Jakarta Sans', sans-serif; }
+
+        .solar-gradient { background: linear-gradient(135deg, #fde047 0%, #fbbf24 50%, #f59e0b 100%); }
+        .glass-card {
+            background: rgba(255, 255, 255, 0.85);
+            backdrop-filter: blur(12px);
+            border: 1px solid rgba(255, 255, 255, 0.35);
+        }
+
+        @keyframes pulse-sun {
+            0%, 100% { transform: scale(1); opacity: 0.85; }
+            50%       { transform: scale(1.12); opacity: 1; }
+        }
+        .sun-loader { animation: pulse-sun 2s infinite ease-in-out; }
+
+        @keyframes fade-up {
+            from { opacity: 0; transform: translateY(10px); }
+            to   { opacity: 1; transform: translateY(0); }
+        }
+        .fade-up { animation: fade-up 0.45s ease-out forwards; }
+
+        @keyframes slide-in {
+            from { opacity: 0; transform: translateX(-8px); }
+            to   { opacity: 1; transform: translateX(0); }
+        }
+        .slide-in { animation: slide-in 0.4s ease-out forwards; }
+
+        /* Mapbox container border-radius passthrough */
+        .mapboxgl-map { border-radius: inherit; }
+        .mapboxgl-ctrl-logo { display: none !important; }
+
+        /* Geocoder dropdown item hover */
+        .geo-item:hover { background: #fffbeb; }
+
+        /* Token warning banner */
+        #token-banner {
+            position: fixed; bottom: 0; left: 0; right: 0;
+            background: #dc2626; color: white;
+            padding: 12px 24px; font-size: 13px; font-weight: 700;
+            z-index: 9999; text-align: center; display: none;
+        }
+    </style>
+</head>
+<body class="bg-slate-50 text-slate-900">
+
+    <!-- Token warning (shown if placeholder not replaced) -->
+    <!-- <div id="token-banner">
+        ⚠️ Mapbox token not set — maps won't load.
+        Open app.html, find <code>YOUR_MAPBOX_TOKEN_HERE</code> and replace it with your free token from
+        <a href="https://account.mapbox.com" target="_blank" class="underline ml-1">account.mapbox.com</a>
+    </div> -->
+
+    <div id="root"></div>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         ⚡ SINAG CONFIGURATION
+         ═══════════════════════════════════════════════════════════════════ -->
+    <script>
+        // ── 1. Mapbox public token ──────────────────────────────────────
+        // Get a FREE token at https://account.mapbox.com/
+        // Replace the string below and save. That's all.
+        window.MAPBOX_TOKEN = 'YOUR_MAPBOX_TOKEN_HERE';
+
+        // Show banner if token hasn't been set
+        if (window.MAPBOX_TOKEN === 'YOUR_MAPBOX_TOKEN_HERE') {
+            const banner = document.getElementById('token-banner');
+            if (banner) {
+                banner.style.display = 'block';
+            }
+        }
+ 
+        // ── 2. Backend API URL ──────────────────────────────────────────
+        // When your FastAPI /estimate endpoint is running, set this:
+        //   window.SINAG_API_URL = 'http://localhost:8000/estimate';
+        // Frontend will POST { lat, lng } and render the JSON response.
+        // Shape must match DEMO_RESULTS below.
+        window.SINAG_API_URL = null;
+
+        // ── 3. Demo data — exact shape your backend must return ─────────
+        window.DEMO_RESULTS = {
+            address:            'Lot 42, Brgy. Don Jose, Santa Rosa, Laguna',
+            lat:                14.3146,
+            lng:                121.1114,
+            readiness_score:    'A+',
+            usable_area_sqm:    85.4,
+            system_size_kwp:    12.5,
+            annual_yield_mwh:   18.2,
+            roof_tilt_deg:      22.5,
+            roof_aspect:        'South-Southwest',
+            monthly_savings_php: 8450,
+            payback_years:      4.2,
+            savings_25yr_php:   2400000,
+            co2_offset_tons:    12.4,
+            trees_equivalent:   420,
+            ghi_kwh_m2_day:     5.1,
+            performance_ratio:  0.75,
+            soiling_factor:     0.93  // Philippines dust/ash correction (Taal effect)
+        };
+
+        // ── 4. Business Dashboard heatmap GeoJSON ──────────────────────
+        // Later: replace with live PostGIS query via your FastAPI /buildings endpoint
+        (function buildHeatmap() {
+            const seed = (n) => { let x = Math.sin(n+1)*10000; return x - Math.floor(x); };
+            const cluster = (lon, lat, n, spread, minI, maxI) =>
+                Array.from({length: n}, (_, i) => ({
+                    type: 'Feature',
+                    geometry: {
+                        type: 'Point',
+                        coordinates: [
+                            lon + (seed(i*3+1) - 0.5) * spread * 2,
+                            lat + (seed(i*3+2) - 0.5) * spread
+                        ]
+                    },
+                    properties: { intensity: minI + seed(i*3+3) * (maxI - minI) }
+                }));
+
+            window.LAGUNA_HEATMAP = {
+                type: 'FeatureCollection',
+                features: [
+                    ...cluster(121.1114, 14.3146, 28, 0.06, 0.75, 0.98), // Santa Rosa — high
+                    ...cluster(121.0786, 14.3393, 22, 0.05, 0.62, 0.90), // Biñan — high
+                    ...cluster(121.1652, 14.2123, 18, 0.06, 0.50, 0.78), // Calamba — mod
+                    ...cluster(121.1220, 14.2750, 14, 0.04, 0.48, 0.72), // Cabuyao — mod
+                    ...cluster(121.2416, 14.1711, 10, 0.04, 0.18, 0.42), // Los Baños — low (Mt. Makiling shade)
+                    ...cluster(121.0494, 14.3586, 12, 0.03, 0.55, 0.80), // San Pedro
+                    ...cluster(121.3200, 14.1500,  8, 0.05, 0.25, 0.55), // Bay / Laguna de Bay fringe
+                ]
+            };
+        })();
+    </script>
+
+    <!-- ═══════════════════════════════════════════════════════════════════
+         React Application
+         ═══════════════════════════════════════════════════════════════════ -->
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useCallback } = React;
+
+        // ─── Navbar ────────────────────────────────────────────────────────
+        const Navbar = ({ view, setView }) => (
+            <nav className="fixed top-0 w-full z-50 glass-card px-6 py-4 flex justify-between items-center shadow-sm">
+                <div className="flex items-center gap-2 cursor-pointer" onClick={() => setView('landing')}>
+                    <div className="w-8 h-8 solar-gradient rounded-full flex items-center justify-center font-extrabold text-white text-sm shadow-md">S</div>
+                    <span className="text-2xl font-extrabold tracking-tight text-slate-800">SINAG</span>
+                </div>
+                <div className="flex gap-5 items-center">
+                    <button
+                        onClick={() => setView('landing')}
+                        className={`text-sm font-bold transition-colors ${view !== 'business' ? 'text-amber-600' : 'text-slate-400 hover:text-slate-700'}`}
+                    >
+                        Consumer View
+                    </button>
+                    <button
+                        onClick={() => setView('business')}
+                        className={`px-4 py-2 rounded-full text-sm font-bold transition-all ${
+                            view === 'business'
+                                ? 'bg-slate-900 text-white shadow-md'
+                                : 'border-2 border-slate-900 text-slate-900 hover:bg-slate-900 hover:text-white'
+                        }`}
+                    >
+                        Business View
+                    </button>
+                </div>
+            </nav>
+        );
+
+        // ─── Landing Page ──────────────────────────────────────────────────
+        const LandingPage = ({ onStart }) => {
+            const [query, setQuery]         = useState('');
+            const [suggestions, setSugs]    = useState([]);
+            const [searching, setSearching] = useState(false);
+            const [focused, setFocused]     = useState(false);
+
+            // Debounced Mapbox Geocoding (filtered to Laguna province bbox)
+            const geocode = useCallback(async (q) => {
+                if (q.length < 3) { setSugs([]); return; }
+                setSearching(true);
+                try {
+                    const bbox   = '120.70,13.70,121.60,14.80'; // Laguna + buffer
+                    const token  = window.MAPBOX_TOKEN;
+                    const url    = `https://api.mapbox.com/geocoding/v5/mapbox.places/${encodeURIComponent(q)}.json`
+                                 + `?access_token=${token}&country=PH&bbox=${bbox}&types=place,neighborhood,address,poi&limit=5`;
+                    const res    = await fetch(url);
+                    const json   = await res.json();
+                    setSugs(json.features || []);
+                } catch (e) {
+                    setSugs([]);
+                } finally {
+                    setSearching(false);
+                }
+            }, []);
+
+            useEffect(() => {
+                const t = setTimeout(() => geocode(query), 320);
+                return () => clearTimeout(t);
+            }, [query, geocode]);
+
+            const selectSuggestion = (feat) => {
+                const [lng, lat] = feat.center;
+                setSugs([]);
+                setQuery(feat.place_name);
+                onStart({ lat, lng, address: feat.place_name });
+            };
+
+            const handleSubmit = () => {
+                if (!query.trim()) return;
+                // If no geocoded coords, center on Santa Rosa as fallback
+                onStart({ lat: 14.3146, lng: 121.1114, address: query });
+            };
+
+            return (
+                <div className="min-h-screen pt-20 flex flex-col items-center justify-center text-center px-4">
+                    <div className="max-w-4xl w-full">
+                        <span className="bg-amber-100 text-amber-700 px-4 py-1.5 rounded-full text-sm font-bold mb-6 inline-block">
+                            🇵🇭 Empowering Laguna's Solar Future
+                        </span>
+
+                        <h1 className="text-6xl md:text-7xl font-extrabold text-slate-900 mb-6 leading-tight">
+                            Ilawan ang iyong <br />
+                            <span className="text-transparent bg-clip-text solar-gradient">kinabukasan.</span>
+                        </h1>
+
+                        <p className="text-xl text-slate-500 mb-10 max-w-2xl mx-auto leading-relaxed">
+                            SINAG uses GeoAI + NASA solar data to measure your exact roof's potential in seconds.
+                            Cut your bills. Help the planet. One rooftop at a time.
+                        </p>
+
+                        {/* Search bar */}
+                        <div className="relative max-w-xl mx-auto mb-16">
+                            <div className={`flex shadow-2xl rounded-full overflow-hidden transition-shadow ${focused ? 'ring-4 ring-amber-300' : ''}`}>
+                                <input
+                                    type="text"
+                                    value={query}
+                                    onChange={e => setQuery(e.target.value)}
+                                    onKeyDown={e => e.key === 'Enter' && handleSubmit()}
+                                    onFocus={() => setFocused(true)}
+                                    onBlur={() => setTimeout(() => setFocused(false), 200)}
+                                    placeholder="Enter your address in Laguna (e.g. Santa Rosa, Biñan...)"
+                                    className="flex-1 px-8 py-5 border-none focus:outline-none text-base"
+                                />
+                                <button
+                                    onClick={handleSubmit}
+                                    className="px-7 solar-gradient text-white font-bold hover:opacity-90 transition-opacity flex items-center gap-2 text-sm whitespace-nowrap"
+                                >
+                                    {searching
+                                        ? <i className="fa-solid fa-spinner fa-spin"></i>
+                                        : <i className="fa-solid fa-magnifying-glass"></i>
+                                    }
+                                    Find My Roof
+                                </button>
+                            </div>
+
+                            {/* Autocomplete dropdown */}
+                            {suggestions.length > 0 && focused && (
+                                <div className="absolute top-full left-0 right-0 mt-2 bg-white rounded-2xl shadow-2xl z-50 overflow-hidden border border-slate-100 fade-up">
+                                    {suggestions.map((s, i) => (
+                                        <div
+                                            key={i}
+                                            className="geo-item px-6 py-4 cursor-pointer border-b border-slate-50 last:border-0 flex items-center gap-3 transition-colors"
+                                            onMouseDown={() => selectSuggestion(s)}
+                                        >
+                                            <i className="fa-solid fa-location-dot text-amber-400 flex-shrink-0"></i>
+                                            <div className="text-left min-w-0">
+                                                <p className="font-semibold text-sm text-slate-800 truncate">{s.text}</p>
+                                                <p className="text-xs text-slate-400 truncate">{s.place_name}</p>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+
+                        {/* Feature cards */}
+                        <div className="grid grid-cols-1 md:grid-cols-3 gap-6 text-left">
+                            {[
+                                { icon: 'fa-bolt', color: 'text-amber-500', title: 'Cut Bills by 60%',    desc: 'Automated ROI using real Meralco/FLECO tariff rates and net-metering law (RA 9513).' },
+                                { icon: 'fa-leaf', color: 'text-green-500', title: 'Zero Emissions',      desc: 'Visualize your household\'s CO₂ offset contribution to the Philippines\' 35% renewables target.' },
+                                { icon: 'fa-microchip', color: 'text-blue-500', title: 'NASA-Grade GeoAI', desc: 'pvlib physics engine + NASA POWER irradiance data for your specific rooftop, not averages.' },
+                            ].map((c, i) => (
+                                <div key={i} className="p-6 bg-white rounded-3xl shadow-sm border border-slate-100 hover:shadow-md transition-shadow">
+                                    <i className={`fa-solid ${c.icon} ${c.color} text-2xl mb-4`}></i>
+                                    <h3 className="font-bold text-lg mb-2">{c.title}</h3>
+                                    <p className="text-slate-500 text-sm leading-relaxed">{c.desc}</p>
+                                </div>
+                            ))}
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // ─── Map Selector ──────────────────────────────────────────────────
+        const MapSelector = ({ initialCoords, onPin }) => {
+            const containerRef  = useRef(null);
+            const mapRef        = useRef(null);
+            const markerRef     = useRef(null);
+            const [pinned, setPinned]     = useState(null);
+            const [mapReady, setMapReady] = useState(false);
+
+            const placeMarker = useCallback((m, lng, lat) => {
+                if (markerRef.current) markerRef.current.remove();
+                const el = document.createElement('div');
+                el.style.cssText = 'font-size:42px;line-height:1;filter:drop-shadow(0 4px 12px rgba(245,158,11,0.65));cursor:pointer;';
+                el.textContent = '📍';
+                markerRef.current = new mapboxgl.Marker({ element: el, anchor: 'bottom' })
+                    .setLngLat([lng, lat])
+                    .addTo(m);
+            }, []);
+
+            useEffect(() => {
+                if (!containerRef.current) return;
+                mapboxgl.accessToken = window.MAPBOX_TOKEN;
+
+                const m = new mapboxgl.Map({
+                    container:  containerRef.current,
+                    style:      'mapbox://styles/mapbox/satellite-streets-v12',
+                    center:     [initialCoords?.lng || 121.1114, initialCoords?.lat || 14.3146],
+                    zoom:       initialCoords ? 17 : 14,
+                    attributionControl: false,
+                });
+
+                m.addControl(new mapboxgl.NavigationControl({ showCompass: true }), 'top-right');
+                m.addControl(new mapboxgl.AttributionControl({ compact: true }), 'bottom-right');
+
+                m.on('load', () => {
+                    setMapReady(true);
+                    if (initialCoords) {
+                        placeMarker(m, initialCoords.lng, initialCoords.lat);
+                        setPinned(initialCoords);
+                    }
+                });
+
+                m.on('click', (e) => {
+                    const { lng, lat } = e.lngLat;
+                    placeMarker(m, lng, lat);
+                    setPinned({ lat, lng });
+                });
+
+                mapRef.current = m;
+                return () => { m.remove(); mapRef.current = null; };
+            }, []);
+
+            return (
+                <div className="min-h-screen pt-24 pb-16 px-6 flex flex-col items-center">
+                    <div className="max-w-5xl w-full text-center mb-6">
+                        <h2 className="text-3xl font-extrabold mb-2">Pin Your Household</h2>
+                        <p className="text-slate-500 text-base">
+                            Navigate the satellite map and click <strong>directly on your rooftop</strong> to begin the GeoAI solar audit.
+                        </p>
+                    </div>
+
+                    {/* Map container */}
+                    <div className="w-full max-w-5xl rounded-3xl shadow-2xl overflow-hidden relative" style={{ height: '520px' }}>
+                        <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+
+                        {/* Loading skeleton */}
+                        {!mapReady && (
+                            <div className="absolute inset-0 bg-slate-800 flex flex-col items-center justify-center gap-3">
+                                <div className="w-12 h-12 solar-gradient rounded-full sun-loader flex items-center justify-center text-2xl">☀️</div>
+                                <p className="text-white text-sm font-semibold opacity-70">Loading satellite imagery…</p>
+                            </div>
+                        )}
+
+                        {/* Instruction pill (disappears once pinned) */}
+                        {!pinned && mapReady && (
+                            <div className="absolute top-4 left-1/2 -translate-x-1/2 bg-slate-900/90 text-white px-5 py-2.5 rounded-full text-sm font-semibold backdrop-blur shadow-xl pointer-events-none fade-up">
+                                <i className="fa-solid fa-hand-pointer mr-2 text-amber-400"></i>
+                                Click on your rooftop to pin it
+                            </div>
+                        )}
+
+                        {/* Zoom hint */}
+                        {!pinned && mapReady && (
+                            <div className="absolute bottom-4 left-4 bg-slate-900/80 text-white px-3 py-2 rounded-xl text-xs font-medium backdrop-blur pointer-events-none">
+                                <i className="fa-solid fa-magnifying-glass-plus mr-1 text-amber-400"></i>
+                                Zoom in until you can see individual rooftops
+                            </div>
+                        )}
+                    </div>
+
+                    {/* Pinned coords + action */}
+                    {pinned && (
+                        <div className="mt-6 flex flex-col sm:flex-row items-center gap-4 fade-up">
+                            <div className="bg-white px-5 py-3 rounded-2xl shadow-sm border border-slate-100 text-sm">
+                                <i className="fa-solid fa-crosshairs mr-2 text-amber-400"></i>
+                                <span className="text-slate-500">Pinned: </span>
+                                <span className="font-bold text-slate-800 font-mono">
+                                    {pinned.lat.toFixed(5)}°N, {pinned.lng.toFixed(5)}°E
+                                </span>
+                            </div>
+                            <button
+                                onClick={() => onPin(pinned)}
+                                className="solar-gradient text-white font-bold px-9 py-3 rounded-2xl shadow-lg hover:shadow-xl hover:opacity-95 transition-all flex items-center gap-2"
+                            >
+                                <i className="fa-solid fa-solar-panel"></i>
+                                Run Solar Analysis
+                            </button>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // ─── Loading Screen ────────────────────────────────────────────────
+        const STEPS = [
+            {
+                icon:     '🛰️',
+                title:    'Detecting Building Footprint',
+                desc:     'Querying Google Open Buildings V3 dataset for your rooftop polygon and applying 10% setback buffer…',
+                duration: 1900,
+            },
+            {
+                icon:     '☀️',
+                title:    'Running Solar Physics Engine',
+                desc:     'pvlib-python computing Plane-of-Array irradiance via NASA POWER GHI data (Reindl transposition model)…',
+                duration: 1900,
+            },
+            {
+                icon:     '📊',
+                title:    'Calculating 25-Year ROI',
+                desc:     'Applying Meralco/FLECO tariff (₱12.00/kWh) + soiling loss correction + net-metering under RA 9513…',
+                duration: 1400,
+            },
+        ];
+
+        const LoadingScreen = ({ coords, onComplete }) => {
+            const [step, setStep]       = useState(0);
+            const [done, setDone]       = useState([]);
+            const [progress, setProgress] = useState(0);
+
+            useEffect(() => {
+                const totalMs = STEPS.reduce((s, x) => s + x.duration, 0);
+                let elapsed = 0;
+
+                const advance = (i) => {
+                    if (i >= STEPS.length) {
+                        setProgress(100);
+                        setTimeout(onComplete, 500);
+                        return;
+                    }
+                    setStep(i);
+                    elapsed += STEPS[i].duration;
+                    const pct = Math.round((elapsed / totalMs) * 100);
+                    setTimeout(() => setProgress(pct), 50);
+                    setTimeout(() => {
+                        setDone(d => [...d, i]);
+                        advance(i + 1);
+                    }, STEPS[i].duration);
+                };
+
+                advance(0);
+            }, []);
+
+            return (
+                <div className="min-h-screen flex flex-col items-center justify-center bg-white px-6">
+                    {/* Pulsing sun */}
+                    <div className="w-28 h-28 solar-gradient rounded-full sun-loader flex items-center justify-center text-5xl mb-10 shadow-2xl shadow-amber-200">
+                        ☀️
+                    </div>
+
+                    {/* Progress bar */}
+                    <div className="w-full max-w-md mb-8">
+                        <div className="flex justify-between text-xs font-bold text-slate-400 uppercase tracking-widest mb-2">
+                            <span>GeoAI Processing</span>
+                            <span>{progress}%</span>
+                        </div>
+                        <div className="w-full bg-slate-100 rounded-full h-2.5 overflow-hidden">
+                            <div
+                                className="solar-gradient h-full rounded-full transition-all duration-700 ease-out"
+                                style={{ width: `${progress}%` }}
+                            />
+                        </div>
+                    </div>
+
+                    {/* Step list */}
+                    <div className="w-full max-w-md space-y-3">
+                        {STEPS.map((s, i) => {
+                            const isActive  = i === step && !done.includes(i);
+                            const isDone    = done.includes(i);
+                            const isPending = !isActive && !isDone;
+                            return (
+                                <div
+                                    key={i}
+                                    className={`flex items-start gap-4 p-4 rounded-2xl transition-all duration-500 ${
+                                        isActive  ? 'bg-amber-50 border-2 border-amber-200 shadow-sm' :
+                                        isDone    ? 'bg-slate-50 opacity-55'                          :
+                                                    'opacity-20'
+                                    }`}
+                                >
+                                    <div className="text-2xl w-9 flex-shrink-0 text-center mt-0.5">
+                                        {isDone ? '✅' : s.icon}
+                                    </div>
+                                    <div className="flex-1 min-w-0">
+                                        <p className={`font-bold text-sm ${isActive ? 'text-slate-800' : 'text-slate-500'}`}>
+                                            {s.title}
+                                        </p>
+                                        {isActive && (
+                                            <p className="text-xs text-slate-400 mt-1 leading-relaxed slide-in">{s.desc}</p>
+                                        )}
+                                    </div>
+                                    {isActive && (
+                                        <i className="fa-solid fa-spinner fa-spin text-amber-400 text-sm flex-shrink-0 mt-1"></i>
+                                    )}
+                                    {isDone && (
+                                        <i className="fa-solid fa-check text-green-400 text-sm flex-shrink-0 mt-1"></i>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+
+                    {coords && (
+                        <p className="mt-8 text-xs text-slate-300 font-mono tracking-wider">
+                            {coords.lat?.toFixed(6)}°N &nbsp;{coords.lng?.toFixed(6)}°E
+                        </p>
+                    )}
+                </div>
+            );
+        };
+
+        // ─── Consumer Results ──────────────────────────────────────────────
+        const ConsumerResults = ({ coords, data }) => {
+            const d = data || window.DEMO_RESULTS || {
+                address: 'Unknown Location',
+                lat: 14.3146,
+                lng: 121.1114,
+                readiness_score: 'N/A',
+                usable_area_sqm: 0,
+                system_size_kwp: 0,
+                annual_yield_mwh: 0,
+                roof_tilt_deg: 0,
+                roof_aspect: 'Unknown',
+                monthly_savings_php: 0,
+                payback_years: 0,
+                savings_25yr_php: 0,
+                co2_offset_tons: 0,
+                trees_equivalent: 0,
+                ghi_kwh_m2_day: 0,
+                performance_ratio: 0,
+                soiling_factor: 0
+            };
+
+            // Satellite mini-map
+            const mapRef    = useRef(null);
+            const mapElRef  = useRef(null);
+
+            // Monthly savings chart
+            const chartRef  = useRef(null);
+            const chartInst = useRef(null);
+
+            /* Satellite mini-map with roof highlight */
+            useEffect(() => {
+                if (!mapElRef.current) return;
+                mapboxgl.accessToken = window.MAPBOX_TOKEN;
+
+                const lat = coords?.lat || d.lat;
+                const lng = coords?.lng || d.lng;
+
+                const m = new mapboxgl.Map({
+                    container:   mapElRef.current,
+                    style:       'mapbox://styles/mapbox/satellite-v9',
+                    center:      [lng, lat],
+                    zoom:        19,
+                    pitch:       50,
+                    bearing:     -15,
+                    interactive: false,
+                    attributionControl: false,
+                });
+
+                m.on('load', () => {
+                    // Approximate usable roof polygon (real backend will return actual footprint GeoJSON)
+                    const halfW = 0.00018;
+                    const halfH = 0.00012;
+                    m.addSource('roof', {
+                        type: 'geojson',
+                        data: {
+                            type: 'Feature',
+                            geometry: {
+                                type: 'Polygon',
+                                coordinates: [[
+                                    [lng - halfW, lat - halfH],
+                                    [lng + halfW, lat - halfH],
+                                    [lng + halfW, lat + halfH],
+                                    [lng - halfW, lat + halfH],
+                                    [lng - halfW, lat - halfH],
+                                ]]
+                            }
+                        }
+                    });
+                    m.addLayer({ id: 'roof-fill',    type: 'fill', source: 'roof', paint: { 'fill-color': '#fbbf24', 'fill-opacity': 0.45 } });
+                    m.addLayer({ id: 'roof-outline', type: 'line', source: 'roof', paint: { 'line-color': '#f59e0b', 'line-width': 3 } });
+                });
+
+                mapRef.current = m;
+                return () => m.remove();
+            }, []);
+
+            /* Monthly savings bar chart */
+            useEffect(() => {
+                if (!chartRef.current) return;
+                if (chartInst.current) chartInst.current.destroy();
+
+                const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                // Philippines: dry season (Nov-Apr) = more sun → higher savings
+                const seasonalMulti = [1.08,1.10,1.12,1.08,1.00,0.88,0.85,0.87,0.90,0.95,1.00,1.05];
+                const base = d.monthly_savings_php;
+                const values = seasonalMulti.map(m => Math.round(base * m));
+
+                chartInst.current = new Chart(chartRef.current, {
+                    type: 'bar',
+                    data: {
+                        labels: months,
+                        datasets: [{
+                            label: 'Monthly Savings (₱)',
+                            data: values,
+                            backgroundColor: months.map((_, i) => i <= 3 || i >= 10 ? 'rgba(251,191,36,0.85)' : 'rgba(251,191,36,0.45)'),
+                            borderColor: '#f59e0b',
+                            borderWidth: 2,
+                            borderRadius: 8,
+                            borderSkipped: false,
+                        }]
+                    },
+                    options: {
+                        responsive: true,
+                        plugins: {
+                            legend: { display: false },
+                            tooltip: {
+                                callbacks: { label: ctx => ` ₱${ctx.raw.toLocaleString()}` }
+                            }
+                        },
+                        scales: {
+                            y: {
+                                beginAtZero: false,
+                                ticks: { callback: v => '₱' + (v/1000).toFixed(1) + 'k' },
+                                grid: { color: 'rgba(0,0,0,0.04)' }
+                            },
+                            x: { grid: { display: false } }
+                        }
+                    }
+                });
+                return () => { if (chartInst.current) chartInst.current.destroy(); };
+            }, []);
+
+            const scoreColors = {
+                'A+': 'text-green-500', A: 'text-green-400',
+                'B+': 'text-amber-500', B: 'text-amber-400', C: 'text-red-400'
+            };
+
+            return (
+                <div className="min-h-screen pt-28 pb-20 px-6 bg-slate-50">
+                    <div className="max-w-6xl mx-auto">
+
+                        {/* Page header */}
+                        <div className="flex flex-wrap justify-between items-start gap-4 mb-8">
+                            <div>
+                                <h1 className="text-4xl font-extrabold mb-1.5">Your Solar Report</h1>
+                                <p className="text-slate-500">
+                                    <i className="fa-solid fa-location-dot mr-2 text-amber-400"></i>
+                                    {d.address}
+                                </p>
+                            </div>
+                            <div className="bg-white px-6 py-4 rounded-2xl shadow-sm border border-slate-100 text-center">
+                                <div className={`text-4xl font-black ${scoreColors[d.readiness_score] || 'text-amber-500'}`}>
+                                    {d.readiness_score}
+                                </div>
+                                <div className="text-[10px] font-bold text-slate-400 uppercase tracking-widest mt-0.5">
+                                    Solar Readiness
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="grid grid-cols-1 lg:grid-cols-3 gap-8">
+
+                            {/* ── Left column ── */}
+                            <div className="lg:col-span-2 space-y-6">
+
+                                {/* Technical Assessment */}
+                                <div className="bg-white p-8 rounded-3xl shadow-sm border border-slate-100">
+                                    <h2 className="text-lg font-bold mb-5 text-slate-700">Technical Assessment</h2>
+                                    <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-6">
+                                        {[
+                                            { label: 'Usable Area',  val: `${d.usable_area_sqm} m²`,   icon: 'fa-house-chimney' },
+                                            { label: 'System Size',  val: `${d.system_size_kwp} kWp`,  icon: 'fa-solar-panel'   },
+                                            { label: 'Annual Yield', val: `${d.annual_yield_mwh} MWh`, icon: 'fa-bolt'          },
+                                            { label: 'Roof Tilt',   val: `${d.roof_tilt_deg}°`,        icon: 'fa-angles-up'     },
+                                        ].map((item, i) => (
+                                            <div key={i} className="bg-slate-50 p-4 rounded-2xl">
+                                                <i className={`fa-solid ${item.icon} text-amber-400 text-sm mb-2`}></i>
+                                                <p className="text-[10px] text-slate-400 font-bold uppercase tracking-widest">{item.label}</p>
+                                                <p className="text-xl font-bold text-slate-800 mt-0.5">{item.val}</p>
+                                            </div>
+                                        ))}
+                                    </div>
+
+                                    {/* pvlib parameters */}
+                                    <div className="grid grid-cols-3 gap-3">
+                                        <div className="bg-sky-50 p-3 rounded-xl">
+                                            <p className="text-[10px] text-sky-400 font-black uppercase tracking-wider">NASA GHI</p>
+                                            <p className="font-bold text-sky-700 text-sm mt-0.5">{d.ghi_kwh_m2_day} kWh/m²/day</p>
+                                        </div>
+                                        <div className="bg-emerald-50 p-3 rounded-xl">
+                                            <p className="text-[10px] text-emerald-500 font-black uppercase tracking-wider">Perf. Ratio</p>
+                                            <p className="font-bold text-emerald-700 text-sm mt-0.5">{d.performance_ratio}</p>
+                                        </div>
+                                        <div className="bg-amber-50 p-3 rounded-xl">
+                                            <p className="text-[10px] text-amber-500 font-black uppercase tracking-wider">Soiling Factor</p>
+                                            <p className="font-bold text-amber-700 text-sm mt-0.5">{d.soiling_factor} <span className="text-xs font-normal opacity-60">(Taal dust)</span></p>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Satellite mini-map */}
+                                <div className="bg-white p-5 rounded-3xl shadow-sm border border-slate-100">
+                                    <div className="flex justify-between items-center mb-3 px-1">
+                                        <h2 className="text-lg font-bold text-slate-700">Rooftop Satellite View</h2>
+                                        <span className="text-xs text-slate-400 font-medium">3D Perspective · Zoom 19</span>
+                                    </div>
+                                    <div ref={mapElRef} style={{ height: '240px', borderRadius: '16px', overflow: 'hidden' }} />
+                                    <p className="text-xs text-slate-400 mt-2 px-1">
+                                        <span className="inline-block w-3 h-3 rounded-sm bg-amber-300 mr-1 align-middle"></span>
+                                        Amber overlay = estimated usable solar area (real footprint from backend)
+                                    </p>
+                                </div>
+
+                                {/* Monthly savings chart */}
+                                <div className="bg-white p-8 rounded-3xl shadow-sm border border-slate-100">
+                                    <div className="flex justify-between items-baseline mb-5">
+                                        <h2 className="text-lg font-bold text-slate-700">Projected Monthly Savings</h2>
+                                        <span className="text-xs text-slate-400">Seasonal PH irradiance model applied</span>
+                                    </div>
+                                    <canvas ref={chartRef} height="130"></canvas>
+                                </div>
+                            </div>
+
+                            {/* ── Right column ── */}
+                            <div className="space-y-6">
+
+                                {/* Financial card */}
+                                <div className="solar-gradient p-8 rounded-3xl text-white shadow-xl shadow-amber-200/60">
+                                    <h3 className="text-2xl font-bold mb-6">Financial Impact</h3>
+                                    <div className="space-y-4 mb-7">
+                                        {[
+                                            { label: 'Monthly Savings',  val: `₱${d.monthly_savings_php.toLocaleString()}` },
+                                            { label: 'Payback Period',   val: `${d.payback_years} Years` },
+                                            { label: '25-Year Savings',  val: `₱${(d.savings_25yr_php/1e6).toFixed(1)}M+` },
+                                            { label: 'Orientation',      val: d.roof_aspect },
+                                        ].map((row, i) => (
+                                            <div key={i} className="flex justify-between items-center border-b border-white/20 pb-3 last:border-0 last:pb-0">
+                                                <span className="opacity-80 text-sm">{row.label}</span>
+                                                <span className="font-black text-base">{row.val}</span>
+                                            </div>
+                                        ))}
+                                    </div>
+                                    <button className="w-full bg-white text-amber-600 font-bold py-4 rounded-2xl shadow-md hover:bg-slate-50 transition-colors text-sm">
+                                        Get Installer Quotes →
+                                    </button>
+                                </div>
+
+                                {/* Environmental card */}
+                                <div className="bg-slate-900 p-8 rounded-3xl text-white">
+                                    <h3 className="font-bold text-lg mb-5">Environmental Impact</h3>
+                                    <div className="space-y-5">
+                                        <div className="flex items-center gap-4">
+                                            <div className="w-12 h-12 bg-green-500/20 border border-green-500/30 rounded-full flex items-center justify-center text-xl flex-shrink-0">🌳</div>
+                                            <div>
+                                                <p className="text-xs opacity-50 uppercase font-bold tracking-wider">Equivalent to</p>
+                                                <p className="font-bold mt-0.5">{d.trees_equivalent} Trees Planted / Year</p>
+                                            </div>
+                                        </div>
+                                        <div className="flex items-center gap-4">
+                                            <div className="w-12 h-12 bg-blue-500/20 border border-blue-500/30 rounded-full flex items-center justify-center text-xl flex-shrink-0">🚗</div>
+                                            <div>
+                                                <p className="text-xs opacity-50 uppercase font-bold tracking-wider">Carbon Offset</p>
+                                                <p className="font-bold mt-0.5">{d.co2_offset_tons} Tons CO₂ / Year</p>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                {/* Data sources */}
+                                <div className="bg-white p-6 rounded-3xl border border-slate-100 shadow-sm">
+                                    <p className="font-bold text-slate-700 mb-3 text-sm">📡 Analysis Powered By</p>
+                                    <ul className="space-y-1.5 text-slate-500 text-xs leading-relaxed">
+                                        <li>• Google Open Buildings V3 (footprint)</li>
+                                        <li>• NASA POWER API (20-yr GHI averages)</li>
+                                        <li>• pvlib-python (Reindl irradiance model)</li>
+                                        <li>• Copernicus DEM 30m (terrain slope)</li>
+                                        <li>• Meralco/FLECO rate: ₱12.00/kWh</li>
+                                        <li>• Net-metering: RA 9513 (NREP)</li>
+                                    </ul>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // ─── Business Dashboard ────────────────────────────────────────────
+        const BusinessDashboard = () => {
+            const mapElRef = useRef(null);
+            const mapRef   = useRef(null);
+
+            useEffect(() => {
+                if (!mapElRef.current) return;
+                mapboxgl.accessToken = window.MAPBOX_TOKEN;
+
+                const m = new mapboxgl.Map({
+                    container: mapElRef.current,
+                    style:     'mapbox://styles/mapbox/dark-v11',
+                    center:    [121.12, 14.27],
+                    zoom:      10.5,
+                    attributionControl: false,
+                });
+
+                m.addControl(new mapboxgl.NavigationControl({ showCompass: false }), 'bottom-right');
+
+                m.on('load', () => {
+                    m.addSource('solar-heat', { type: 'geojson', data: window.LAGUNA_HEATMAP });
+
+                    m.addLayer({
+                        id:     'heatmap-layer',
+                        type:   'heatmap',
+                        source: 'solar-heat',
+                        paint: {
+                            // Weight each point by its intensity property
+                            'heatmap-weight': ['get', 'intensity'],
+                            // Heatmap intensity scales with zoom
+                            'heatmap-intensity': ['interpolate', ['linear'], ['zoom'], 9, 0.8, 14, 2.5],
+                            // Spread radius grows with zoom
+                            'heatmap-radius': ['interpolate', ['linear'], ['zoom'], 9, 25, 14, 55],
+                            // Color ramp: Red → Yellow → Green (matches doc spec)
+                            'heatmap-color': [
+                                'interpolate', ['linear'], ['heatmap-density'],
+                                0,    'rgba(0,0,0,0)',
+                                0.15, '#dc2626',   // Low  — Red
+                                0.45, '#fbbf24',   // Mod  — Yellow
+                                0.75, '#4ade80',   // High — Green
+                                1.0,  '#ecfdf5',   // Peak — near-white
+                            ],
+                            'heatmap-opacity': 0.82,
+                        }
+                    });
+
+                    // Add circle layer at high zoom to show individual building scores
+                    m.addLayer({
+                        id:     'building-dots',
+                        type:   'circle',
+                        source: 'solar-heat',
+                        minzoom: 13,
+                        paint: {
+                            'circle-radius':       6,
+                            'circle-color': [
+                                'interpolate', ['linear'], ['get', 'intensity'],
+                                0.2, '#dc2626', 0.5, '#fbbf24', 0.8, '#4ade80'
+                            ],
+                            'circle-opacity':      0.9,
+                            'circle-stroke-width': 1.5,
+                            'circle-stroke-color': 'rgba(255,255,255,0.3)',
+                        }
+                    });
+                });
+
+                mapRef.current = m;
+                return () => m.remove();
+            }, []);
+
+            return (
+                <div className="min-h-screen bg-slate-950 pt-24 pb-12 px-8 text-white">
+
+                    {/* Header */}
+                    <div className="flex flex-wrap justify-between items-end gap-4 mb-10">
+                        <div>
+                            <h1 className="text-4xl font-extrabold mb-1.5 text-amber-400">Regional Intelligence</h1>
+                            <p className="text-slate-400 font-medium">Laguna Province · Multi-Scalar Solar Audit Dashboard</p>
+                        </div>
+                        <div className="flex gap-3">
+                            <button className="bg-slate-800 hover:bg-slate-700 transition-colors px-5 py-2.5 rounded-xl font-bold text-sm flex items-center gap-2">
+                                <i className="fa-solid fa-download"></i>Export CSV
+                            </button>
+                            <button className="bg-amber-500 hover:bg-amber-400 transition-colors px-5 py-2.5 rounded-xl font-bold text-sm text-slate-900 shadow-lg shadow-amber-500/20">
+                                Partner Portal
+                            </button>
+                        </div>
+                    </div>
+
+                    {/* Map + KPIs */}
+                    <div className="grid grid-cols-1 lg:grid-cols-4 gap-8 mb-10">
+
+                        {/* Heatmap */}
+                        <div className="lg:col-span-3 bg-slate-900 rounded-3xl border border-slate-800 overflow-hidden relative shadow-2xl" style={{ height: '520px' }}>
+                            <div ref={mapElRef} style={{ width: '100%', height: '100%' }} />
+
+                            {/* Live badge */}
+                            <div className="absolute top-5 left-5 pointer-events-none">
+                                <div className="bg-slate-900/90 backdrop-blur px-4 py-2 rounded-xl border border-slate-700 text-xs font-bold flex items-center gap-2">
+                                    <span className="w-2.5 h-2.5 rounded-full bg-green-400 animate-pulse"></span>
+                                    LIVE FEED · LAGUNA SOLAR GRID
+                                </div>
+                            </div>
+
+                            {/* Legend */}
+                            <div className="absolute bottom-5 left-5 bg-slate-900/90 backdrop-blur p-4 rounded-2xl border border-slate-700 pointer-events-none">
+                                <p className="text-[10px] text-slate-400 uppercase font-black mb-2.5 tracking-widest">Solar Potential</p>
+                                <div className="w-28 h-2.5 rounded-full" style={{ background: 'linear-gradient(to right, #dc2626, #fbbf24, #4ade80)' }}></div>
+                                <div className="flex justify-between text-[10px] text-slate-400 mt-1.5 w-28">
+                                    <span>Low</span><span>Moderate</span><span>High</span>
+                                </div>
+                                <p className="text-[9px] text-slate-600 mt-2">Zoom in to see building-level scores</p>
+                            </div>
+
+                            {/* Filter panel */}
+                            <div className="absolute top-5 right-16 bg-slate-900/90 backdrop-blur p-4 rounded-xl border border-slate-700 text-xs">
+                                <p className="text-[10px] text-slate-500 uppercase tracking-widest font-black mb-2">Layers</p>
+                                <label className="flex items-center gap-2 mb-1.5 cursor-pointer">
+                                    <input type="checkbox" defaultChecked className="accent-amber-500" />
+                                    <span>Solar Potential Heat</span>
+                                </label>
+                                <label className="flex items-center gap-2 cursor-pointer">
+                                    <input type="checkbox" defaultChecked className="accent-amber-500" />
+                                    <span>Building Scores</span>
+                                </label>
+                            </div>
+                        </div>
+
+                        {/* KPI cards */}
+                        <div className="space-y-5">
+                            <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800">
+                                <p className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1.5">Total Identified</p>
+                                <p className="text-4xl font-black">1,420 <span className="text-sm font-normal text-slate-500">GWh</span></p>
+                                <div className="mt-3 p-3 bg-green-500/10 rounded-xl flex items-center gap-2.5">
+                                    <i className="fa-solid fa-chart-line text-green-400 text-sm"></i>
+                                    <span className="text-xs font-bold text-green-400">+12% potential vs 2025</span>
+                                </div>
+                            </div>
+                            <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800">
+                                <p className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1.5">Market Valuation</p>
+                                <p className="text-4xl font-black">₱4.8 <span className="text-sm font-normal text-slate-500">B</span></p>
+                                <p className="text-xs text-slate-600 mt-2">Targetable Residential Assets</p>
+                            </div>
+                            <div className="bg-amber-500 p-6 rounded-3xl shadow-xl shadow-amber-500/15 text-slate-950">
+                                <p className="text-xs font-black uppercase opacity-60 mb-1">Ready Lead Clusters</p>
+                                <p className="text-4xl font-black italic">12,402</p>
+                                <p className="text-xs font-bold mt-1.5">Households with &gt;80% ROI Score</p>
+                            </div>
+                            <div className="bg-slate-900 p-6 rounded-3xl border border-slate-800">
+                                <p className="text-xs font-bold text-slate-500 uppercase tracking-widest mb-1.5">Anti-Brownout Zones</p>
+                                <p className="text-3xl font-black text-red-400">847</p>
+                                <p className="text-xs text-slate-600 mt-1.5">High-potential areas with &gt;12h/mo outages (FLECO SAIDI)</p>
+                            </div>
+                        </div>
+                    </div>
+
+                    {/* Bottom tables */}
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+
+                        {/* LGU leaderboard */}
+                        <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800">
+                            <h3 className="text-xl font-bold mb-6">🏆 LGU Solar Leaderboard</h3>
+                            <div className="space-y-5">
+                                {[
+                                    { name: 'Santa Rosa', potential: '142 MW', pct: 80, color: 'bg-amber-500', badge: '🥇' },
+                                    { name: 'Biñan',      potential: '110 MW', pct: 62, color: 'bg-slate-600', badge: '🥈' },
+                                    { name: 'Calamba',    potential: '95 MW',  pct: 54, color: 'bg-slate-600', badge: '🥉' },
+                                    { name: 'Cabuyao',    potential: '62 MW',  pct: 35, color: 'bg-slate-700', badge: '#4' },
+                                    { name: 'Los Baños',  potential: '38 MW',  pct: 21, color: 'bg-slate-800', badge: '#5' },
+                                ].map((lgu, i) => (
+                                    <div key={i} className="flex items-center gap-3">
+                                        <span className="text-base w-6 flex-shrink-0">{lgu.badge.startsWith('#') ? <span className="text-slate-600 font-black text-xs">{lgu.badge}</span> : lgu.badge}</span>
+                                        <div className="flex-1">
+                                            <div className="flex justify-between mb-1.5">
+                                                <span className="font-bold text-sm">{lgu.name}</span>
+                                                <span className="text-slate-400 text-sm">{lgu.potential}</span>
+                                            </div>
+                                            <div className="w-full bg-slate-800 h-2 rounded-full overflow-hidden">
+                                                <div className={`${lgu.color} h-full rounded-full`} style={{ width: `${lgu.pct}%` }}></div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                ))}
+                            </div>
+                        </div>
+
+                        {/* Commercial leads table */}
+                        <div className="bg-slate-900 p-8 rounded-3xl border border-slate-800">
+                            <h3 className="text-xl font-bold mb-6">🎯 Commercial Lead Opportunities</h3>
+                            <table className="w-full text-left">
+                                <thead>
+                                    <tr className="text-slate-500 text-xs uppercase tracking-wider border-b border-slate-800">
+                                        <th className="pb-3">Cluster</th>
+                                        <th className="pb-3">ROI Class</th>
+                                        <th className="pb-3">Avail. Area</th>
+                                        <th className="pb-3"></th>
+                                    </tr>
+                                </thead>
+                                <tbody className="text-sm font-medium">
+                                    {[
+                                        { name: 'Santa Rosa Estates', roi: 'Prime',     cls: 'text-green-400 bg-green-400/10', area: '42,500 m²' },
+                                        { name: 'Biñan Heights',      roi: 'High',      cls: 'text-amber-400 bg-amber-400/10', area: '28,100 m²' },
+                                        { name: 'Canlubang Industrial', roi: 'Corporate', cls: 'text-blue-400  bg-blue-400/10',  area: '152,000 m²' },
+                                        { name: 'Cabuyao Lakeview',   roi: 'Emerging',  cls: 'text-purple-400 bg-purple-400/10', area: '19,200 m²' },
+                                    ].map((r, i) => (
+                                        <tr key={i} className="border-b border-slate-800/60 last:border-0">
+                                            <td className="py-3.5">{r.name}</td>
+                                            <td className="py-3.5">
+                                                <span className={`${r.cls} px-2 py-1 rounded-lg text-xs font-bold`}>{r.roi}</span>
+                                            </td>
+                                            <td className="py-3.5 text-slate-400 text-xs">{r.area}</td>
+                                            <td className="py-3.5 text-amber-400 hover:text-amber-300 cursor-pointer text-xs font-bold">View →</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // ─── App — State Machine ───────────────────────────────────────────
+        const App = () => {
+            const [view, setView]       = useState('landing');
+            const [location, setLoc]    = useState(null);
+            const [results, setResults] = useState(null);
+
+            // Store the in-flight API promise so the loading screen can await it
+            const apiFetchRef = useRef(null);
+
+            const handleStart = (locData) => {
+                setLoc(locData);
+                setView('consumer-map');
+            };
+
+            // Called from MapSelector — starts the fetch but does NOT await it here.
+            // The loading screen will await the promise before transitioning to results.
+            const handlePin = (coords) => {
+                const merged = { ...location, ...coords };
+                setLoc(merged);
+                setView('loading');
+
+                if (window.SINAG_API_URL) {
+                    apiFetchRef.current = fetch(window.SINAG_API_URL, {
+                        method:  'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body:    JSON.stringify({ lat: coords.lat, lng: coords.lng }),
+                    })
+                    .then(res => res.ok ? res.json() : null)
+                    .catch(e => {
+                        console.warn('[SINAG] API unreachable — using demo data.', e.message);
+                        return null;
+                    });
+                } else {
+                    apiFetchRef.current = Promise.resolve(null);
+                }
+            };
+
+            // Called by LoadingScreen after its animation completes.
+            // Awaits the API promise so results are always ready before rendering.
+            const handleLoadingComplete = async () => {
+                if (apiFetchRef.current) {
+                    try {
+                        const data = await apiFetchRef.current;
+                        // Only use real data if it looks valid (has 'address' field)
+                        if (data && data.address !== undefined) {
+                            setResults(data);
+                        }
+                    } catch (e) {
+                        console.warn('[SINAG] Could not use API results:', e.message);
+                    }
+                }
+                setView('consumer-results');
+            };
+
+            return (
+                <div>
+                    <Navbar view={view} setView={setView} />
+                    {view === 'landing' && (
+                        <LandingPage onStart={handleStart} />
+                    )}
+                    {view === 'consumer-map' && (
+                        <MapSelector initialCoords={location} onPin={handlePin} />
+                    )}
+                    {view === 'loading' && (
+                        <LoadingScreen
+                            coords={location}
+                            onComplete={handleLoadingComplete}
+                        />
+                    )}
+                    {view === 'consumer-results' && (
+                        <ConsumerResults coords={location} data={results} />
+                    )}
+                    {view === 'business' && (
+                        <BusinessDashboard />
+                    )}
+                </div>
+            );
+        };
+
+        ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+    </script>
+</body>
+</html>
